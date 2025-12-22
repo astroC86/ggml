@@ -98,6 +98,27 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
     endif()
 
+    if (GGML_NOSV)
+        if (WIN32)
+            message(FATAL_ERROR "GGML_NOSV is not supported on Windows")
+        endif()
+        if (GGML_OPENMP)
+            message(FATAL_ERROR "GGML_NOSV requires GGML_OPENMP=OFF")
+        endif()
+
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(NOSV REQUIRED IMPORTED_TARGET nos-v)
+
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_NOSV)
+        target_link_libraries(${GGML_CPU_NAME} PRIVATE PkgConfig::NOSV)
+        if (TARGET ggml)
+            target_link_libraries(ggml INTERFACE PkgConfig::NOSV)
+            if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                target_link_options(ggml INTERFACE "-Wl,--no-as-needed")
+            endif()
+        endif()
+    endif()
+
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")
         message(STATUS "ARM detected")
         list(APPEND GGML_CPU_SOURCES

@@ -190,6 +190,10 @@ typedef void * thread_ret_t;
 
 #endif
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+#include <nosv/compat.h>
+#endif
+
 typedef pthread_t ggml_thread_t;
 
 #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
@@ -418,7 +422,6 @@ typedef SRWLOCK            ggml_mutex_t;
 
 #else
 
-typedef pthread_cond_t     ggml_cond_t;
 typedef pthread_mutex_t    ggml_mutex_t;
 
 #define ggml_mutex_init(m)          pthread_mutex_init(m, NULL)
@@ -438,13 +441,28 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #define ggml_lock_unlock(x)  UNUSED(x)
 
 #define GGML_LOCK_INITIALIZER 0
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+typedef nosv_cond_t ggml_cond_t;
+
+#define ggml_cond_init(c)      nosv_cond_init(c, NULL)
+#define ggml_cond_destroy(c)   nosv_cond_destroy(c)
+#define ggml_cond_wait(c, m)   nosv_cond_wait_pthread(c, m)
+#define ggml_cond_broadcast(c) nosv_cond_broadcast(c)
+#else
+typedef pthread_cond_t ggml_cond_t;
+
 #define ggml_cond_init(c)      pthread_cond_init(c, NULL)
 #define ggml_cond_destroy(c)   pthread_cond_destroy(c)
 #define ggml_cond_wait(c, m)   pthread_cond_wait(c, m)
 #define ggml_cond_broadcast(c) pthread_cond_broadcast(c)
+#endif
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+#define ggml_thread_create nosv_pthread_create
+#else
 #define ggml_thread_create pthread_create
-#define ggml_thread_join   pthread_join
+#endif
+#define ggml_thread_join pthread_join
 
 #endif
 
@@ -472,6 +490,13 @@ struct ggml_threadpool {
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    bool         nosv_inited;
+    ggml_thread_t nosv_owner;
+    bool         nosv_type_inited;
+    nosv_task_type_t nosv_type;
+#endif
+
     enum ggml_status ec;
 };
 
@@ -486,6 +511,51 @@ struct ggml_compute_state {
     struct ggml_threadpool * threadpool;
     int ith;
 };
+
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+struct ggml_nosv_node_task_data {
+    struct ggml_threadpool * threadpool;
+    struct ggml_tensor * node;
+    const struct ggml_cplan * cplan;
+    int node_index;
+    int nth;
+};
+
+static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor);
+
+static inline int ggml_nosv_map_priority(int32_t prio) {
+    switch (prio) {
+        case GGML_SCHED_PRIO_LOW:      return -1;
+        case GGML_SCHED_PRIO_NORMAL:   return 0;
+        case GGML_SCHED_PRIO_MEDIUM:   return 1;
+        case GGML_SCHED_PRIO_HIGH:     return 2;
+        case GGML_SCHED_PRIO_REALTIME: return 3;
+        default:                       return 0;
+    }
+}
+
+static void ggml_nosv_node_task_run(nosv_task_t task) {
+    struct ggml_nosv_node_task_data * data = (struct ggml_nosv_node_task_data *) nosv_get_task_metadata(task);
+    const int ith = (int) nosv_get_execution_id();
+    struct ggml_threadpool * tp = data->threadpool;
+
+    struct ggml_compute_params params = {
+        /*.ith       =*/ ith,
+        /*.nth       =*/ data->nth,
+        /*.wsize     =*/ data->cplan->work_size,
+        /*.wdata     =*/ data->cplan->work_data,
+        /*.threadpool=*/ tp,
+    };
+
+    ggml_compute_forward(&params, data->node);
+
+    if (ith == 0 && data->cplan->abort_callback &&
+            data->cplan->abort_callback(data->cplan->abort_callback_data)) {
+        atomic_store_explicit(&tp->abort, data->node_index + 1, memory_order_relaxed);
+        tp->ec = GGML_STATUS_ABORTED;
+    }
+}
+#endif
 
 // Helpers for polling loops
 #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
@@ -2646,6 +2716,10 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     const int n_threads = threadpool->n_threads;
 
 #ifndef GGML_USE_OPENMP
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    ggml_mutex_destroy(&threadpool->mutex);
+    ggml_cond_destroy(&threadpool->cond);
+#else
     struct ggml_compute_state* workers = threadpool->workers;
 
     ggml_mutex_lock(&threadpool->mutex);
@@ -2664,7 +2738,27 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
+#endif
 #endif // GGML_USE_OPENMP
+
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    if (threadpool->nosv_type_inited) {
+        int type_rc = nosv_type_destroy(threadpool->nosv_type, NOSV_TYPE_DESTROY_NONE);
+        if (type_rc != 0) {
+            GGML_ABORT("nosv_type_destroy failed: %s (%d)", nosv_get_error_string(type_rc), type_rc);
+        }
+        threadpool->nosv_type_inited = false;
+    }
+
+    if (threadpool->nosv_inited && pthread_equal(pthread_self(), threadpool->nosv_owner)) {
+        int nosv_rc = nosv_shutdown();
+        if (nosv_rc != 0) {
+            GGML_ABORT("nosv_shutdown failed: %s (%d)", nosv_get_error_string(nosv_rc), nosv_rc);
+        }
+    } else if (threadpool->nosv_inited) {
+        GGML_LOG_WARN("nosv_shutdown skipped because threadpool was freed on a different thread\n");
+    }
+#endif
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
@@ -3125,6 +3219,33 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    threadpool->nosv_inited = false;
+    threadpool->nosv_owner  = pthread_self();
+    threadpool->nosv_type_inited = false;
+#ifndef GGML_USE_OPENMP
+    int nosv_rc = nosv_init();
+    if (nosv_rc != 0) {
+        GGML_ABORT("nosv_init failed: %s (%d)", nosv_get_error_string(nosv_rc), nosv_rc);
+    }
+    threadpool->nosv_inited = true;
+
+    int type_rc = nosv_type_init(
+        &threadpool->nosv_type,
+        ggml_nosv_node_task_run,
+        NULL,
+        NULL,
+        "ggml-node",
+        NULL,
+        NULL,
+        NOSV_TYPE_INIT_NONE);
+    if (type_rc != 0) {
+        GGML_ABORT("nosv_type_init failed: %s (%d)", nosv_get_error_string(type_rc), type_rc);
+    }
+    threadpool->nosv_type_inited = true;
+#endif
+#endif
+
     // Allocate and init workers state
     const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
     struct ggml_compute_state * workers = ggml_aligned_malloc(workers_size);
@@ -3153,6 +3274,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 
     int32_t cpumask_iter = 0;
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    for (int j = 0; j < tpp->n_threads; j++) {
+        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+    }
+#else
     for (int j = 1; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
 
@@ -3169,6 +3295,7 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
+#endif
 #endif // GGML_USE_OPENMP
 
     return threadpool;
@@ -3178,7 +3305,121 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+static enum ggml_status ggml_graph_compute_nosv(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+    ggml_cpu_init();
+
+    GGML_ASSERT(cplan);
+    GGML_ASSERT(cplan->n_threads > 0);
+    GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+
+    int n_threads = cplan->n_threads;
+    struct ggml_threadpool * threadpool = cplan->threadpool;
+    bool disposable_threadpool = false;
+
+    if (threadpool == NULL) {
+        disposable_threadpool = true;
+
+        struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
+        threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
+    } else {
+        threadpool->cgraph           = cgraph;
+        threadpool->cplan            = cplan;
+        threadpool->current_chunk    = 0;
+        threadpool->abort            = -1;
+        threadpool->ec               = GGML_STATUS_SUCCESS;
+    }
+
+    if (n_threads > threadpool->n_threads) {
+        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+        n_threads = threadpool->n_threads;
+    }
+
+    if (!threadpool->nosv_type_inited) {
+        int type_rc = nosv_type_init(
+            &threadpool->nosv_type,
+            ggml_nosv_node_task_run,
+            NULL,
+            NULL,
+            "ggml-node",
+            NULL,
+            NULL,
+            NOSV_TYPE_INIT_NONE);
+        if (type_rc != 0) {
+            GGML_ABORT("nosv_type_init failed: %s (%d)", nosv_get_error_string(type_rc), type_rc);
+        }
+        threadpool->nosv_type_inited = true;
+    }
+
+    nosv_task_t main_task;
+    int attach_rc = nosv_attach(&main_task, NULL, "ggml-main", NOSV_ATTACH_NONE);
+    if (attach_rc != 0) {
+        GGML_ABORT("nosv_attach failed: %s (%d)", nosv_get_error_string(attach_rc), attach_rc);
+    }
+
+    for (int node_n = 0; node_n < cgraph->n_nodes &&
+            atomic_load_explicit(&threadpool->abort, memory_order_relaxed) == -1; node_n++) {
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+
+        if (ggml_op_is_empty(node->op)) {
+            continue;
+        }
+
+        int n_tasks = ggml_get_n_tasks(node, n_threads);
+        if (n_tasks < 1) {
+            n_tasks = 1;
+        }
+
+        atomic_store_explicit(&threadpool->n_graph, n_tasks, memory_order_relaxed);
+
+        nosv_task_t task;
+        int create_rc = nosv_create(&task, threadpool->nosv_type, sizeof(struct ggml_nosv_node_task_data), NOSV_CREATE_PARALLEL);
+        if (create_rc != 0) {
+            GGML_ABORT("nosv_create failed: %s (%d)", nosv_get_error_string(create_rc), create_rc);
+        }
+
+        struct ggml_nosv_node_task_data * data = (struct ggml_nosv_node_task_data *) nosv_get_task_metadata(task);
+        *data = (struct ggml_nosv_node_task_data) {
+            .threadpool = threadpool,
+            .node       = node,
+            .cplan      = cplan,
+            .node_index = node_n,
+            .nth        = n_tasks,
+        };
+
+        nosv_set_task_degree(task, n_tasks);
+        nosv_set_task_priority(task, ggml_nosv_map_priority(threadpool->prio));
+
+        int submit_rc = nosv_submit(task, NOSV_SUBMIT_BLOCKING);
+        if (submit_rc != 0) {
+            GGML_ABORT("nosv_submit failed: %s (%d)", nosv_get_error_string(submit_rc), submit_rc);
+        }
+
+        int destroy_rc = nosv_destroy(task, NOSV_DESTROY_NONE);
+        if (destroy_rc != 0) {
+            GGML_ABORT("nosv_destroy failed: %s (%d)", nosv_get_error_string(destroy_rc), destroy_rc);
+        }
+    }
+
+    int detach_rc = nosv_detach(NOSV_DETACH_NONE);
+    if (detach_rc != 0) {
+        GGML_ABORT("nosv_detach failed: %s (%d)", nosv_get_error_string(detach_rc), detach_rc);
+    }
+
+    enum ggml_status ret = threadpool->ec;
+
+    if (disposable_threadpool) {
+        ggml_threadpool_free(threadpool);
+    }
+
+    return ret;
+}
+#endif
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
+#if defined(GGML_USE_NOSV) && !defined(_WIN32)
+    return ggml_graph_compute_nosv(cgraph, cplan);
+#endif
     ggml_cpu_init();
 
     GGML_ASSERT(cplan);

@@ -156,6 +156,17 @@ if (GGML_OPENBLAS)
     endif()
 endif()
 
+if (GGML_NOSV)
+    if (NOT TARGET PkgConfig::NOSV)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(NOSV REQUIRED IMPORTED_TARGET nos-v)
+    endif()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_link_options(-Wl,--no-as-needed)
+    endif()
+    link_libraries(PkgConfig::NOSV)
+endif()
+
 # undefine NDEBUG so asserts don't get disabled in tests
 add_definitions(-UNDEBUG)
 

@@ -57,6 +57,15 @@ cmake -DGGML_CUDA=ON -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc ..
 cmake -DCMAKE_C_COMPILER="$(hipconfig -l)/clang" -DCMAKE_CXX_COMPILER="$(hipconfig -l)/clang++" -DGGML_HIP=ON
 ```
 
+## Using nOS-V
+
+```bash
+# ensure pkg-config can find nos-v (adjust the path as needed)
+export PKG_CONFIG_PATH=/path/to/nosv/lib/pkgconfig
+
+cmake -DGGML_NOSV=ON -DGGML_OPENMP=OFF ..
+```
+
 ## Using SYCL
 
 ```bash
